@@ -7,6 +7,8 @@ import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
@@ -24,15 +26,22 @@ public class ChatScrollLockPlugin extends Plugin
 	private Client client;
 
 	@Inject
+	private ClientThread clientThread;
+
+	@Inject
 	private ChatScrollLockConfig config;
 
 	private int savedScrollY = -1;
 	private boolean isLocked = false;
+	private int lastScrollY = -1;
 
 	@Override
 	protected void startUp() throws Exception
 	{
 		log.debug("Chat Scroll Lock started");
+		savedScrollY = -1;
+		isLocked = false;
+		lastScrollY = -1;
 	}
 
 	@Override
@@ -41,10 +50,11 @@ public class ChatScrollLockPlugin extends Plugin
 		log.debug("Chat Scroll Lock stopped");
 		savedScrollY = -1;
 		isLocked = false;
+		lastScrollY = -1;
 	}
 
 	@Subscribe
-	public void onChatMessage(ChatMessage event)
+	public void onGameTick(GameTick event)
 	{
 		if (!config.enabled())
 		{
@@ -61,31 +71,56 @@ public class ChatScrollLockPlugin extends Plugin
 		int scrollHeight = chatbox.getScrollHeight();
 		int height = chatbox.getHeight();
 
-		// Check if user is scrolled up (not at the bottom)
-		boolean isAtBottom = scrollY >= scrollHeight - height;
+		// Calculate if we're at the bottom (with small tolerance)
+		boolean isAtBottom = scrollY >= scrollHeight - height - 5;
 
-		if (!isAtBottom && !isLocked)
+		// If user manually scrolled (scroll position changed and we didn't cause it)
+		if (lastScrollY >= 0 && scrollY != lastScrollY)
 		{
-			// User just scrolled up, lock the position
-			savedScrollY = scrollY;
-			isLocked = true;
-			log.debug("Chat locked at scrollY: {}", savedScrollY);
+			if (isAtBottom)
+			{
+				// User scrolled to bottom, unlock
+				if (isLocked)
+				{
+					isLocked = false;
+					savedScrollY = -1;
+					log.debug("Chat unlocked - user scrolled to bottom");
+				}
+			}
+			else if (!isLocked)
+			{
+				// User scrolled up, lock at this position
+				isLocked = true;
+				savedScrollY = scrollY;
+				log.debug("Chat locked at scrollY: {}", savedScrollY);
+			}
 		}
-		else if (isLocked && savedScrollY >= 0)
+
+		lastScrollY = scrollY;
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (!config.enabled() || !isLocked || savedScrollY < 0)
 		{
-			// Restore the scroll position after new message
+			return;
+		}
+
+		// Use invokeLater to restore scroll after the game processes the message
+		clientThread.invokeLater(() ->
+		{
+			Widget chatbox = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
+			if (chatbox == null)
+			{
+				return;
+			}
+
 			chatbox.setScrollY(savedScrollY);
 			chatbox.revalidateScroll();
+			lastScrollY = savedScrollY;
 			log.debug("Restored scroll position to: {}", savedScrollY);
-		}
-
-		// If user scrolls back to bottom, unlock
-		if (isAtBottom && isLocked)
-		{
-			isLocked = false;
-			savedScrollY = -1;
-			log.debug("Chat unlocked - returned to bottom");
-		}
+		});
 	}
 
 	@Provides
