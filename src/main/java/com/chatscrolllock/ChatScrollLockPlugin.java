@@ -6,9 +6,8 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.events.ChatMessage;
-import net.runelite.api.events.GameTick;
-import net.runelite.client.callback.ClientThread;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.ScriptID;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
@@ -22,29 +21,17 @@ import net.runelite.client.plugins.PluginDescriptor;
 )
 public class ChatScrollLockPlugin extends Plugin
 {
-	private static final int BOTTOM_THRESHOLD = 10;
+	private static final int BOTTOM_THRESHOLD = 15;
 
 	@Inject
 	private Client client;
 
 	@Inject
-	private ClientThread clientThread;
-
-	@Inject
 	private ChatScrollLockConfig config;
 
-	// The scroll position to maintain when locked
-	private int lockedScrollY = -1;
-
-	// Track if we're currently locked (user scrolled up)
+	// Track distance from bottom when locked (more stable than absolute scrollY)
+	private int lockedDistanceFromBottom = -1;
 	private boolean isLocked = false;
-
-	// Flag to ignore scroll changes we caused
-	private boolean ignoringScrollChange = false;
-
-	// Track scroll position from before any message arrives
-	private int preMessageScrollY = -1;
-	private boolean wasAtBottom = true;
 
 	@Override
 	protected void startUp() throws Exception
@@ -62,27 +49,35 @@ public class ChatScrollLockPlugin extends Plugin
 
 	private void reset()
 	{
-		lockedScrollY = -1;
+		lockedDistanceFromBottom = -1;
 		isLocked = false;
-		ignoringScrollChange = false;
-		preMessageScrollY = -1;
-		wasAtBottom = true;
 	}
 
-	private boolean isAtBottom(Widget chatbox)
+	private int getDistanceFromBottom(Widget chatbox)
 	{
 		int scrollY = chatbox.getScrollY();
 		int scrollHeight = chatbox.getScrollHeight();
 		int height = chatbox.getHeight();
-		return scrollY >= scrollHeight - height - BOTTOM_THRESHOLD;
+		// Distance from bottom = how far up from the bottom we are
+		return scrollHeight - height - scrollY;
+	}
+
+	private boolean isAtBottom(Widget chatbox)
+	{
+		return getDistanceFromBottom(chatbox) <= BOTTOM_THRESHOLD;
 	}
 
 	@Subscribe
-	public void onGameTick(GameTick event)
+	public void onScriptPostFired(ScriptPostFired event)
 	{
 		if (!config.enabled())
 		{
-			reset();
+			return;
+		}
+
+		// BUILD_CHATBOX is the script that runs when chat is updated
+		if (event.getScriptId() != ScriptID.BUILD_CHATBOX)
+		{
 			return;
 		}
 
@@ -92,68 +87,42 @@ public class ChatScrollLockPlugin extends Plugin
 			return;
 		}
 
-		int currentScrollY = chatbox.getScrollY();
-		boolean currentlyAtBottom = isAtBottom(chatbox);
+		int distanceFromBottom = getDistanceFromBottom(chatbox);
+		boolean atBottom = distanceFromBottom <= BOTTOM_THRESHOLD;
 
-		// If we're ignoring this tick (because we just set scroll), skip logic
-		if (ignoringScrollChange)
+		if (isLocked)
 		{
-			ignoringScrollChange = false;
-			preMessageScrollY = currentScrollY;
-			wasAtBottom = currentlyAtBottom;
-			return;
-		}
-
-		// Check if user scrolled to bottom - unlock
-		if (currentlyAtBottom && isLocked)
-		{
-			isLocked = false;
-			lockedScrollY = -1;
-			log.debug("Unlocked - user at bottom");
-		}
-		// Check if user scrolled up from bottom - lock
-		else if (!currentlyAtBottom && wasAtBottom && !isLocked)
-		{
-			isLocked = true;
-			lockedScrollY = currentScrollY;
-			log.debug("Locked at scrollY: {}", lockedScrollY);
-		}
-		// User scrolled while locked - update lock position
-		else if (isLocked && !currentlyAtBottom && currentScrollY != preMessageScrollY)
-		{
-			lockedScrollY = currentScrollY;
-			log.debug("Updated lock to scrollY: {}", lockedScrollY);
-		}
-
-		// Save state for next tick
-		preMessageScrollY = currentScrollY;
-		wasAtBottom = currentlyAtBottom;
-	}
-
-	@Subscribe
-	public void onChatMessage(ChatMessage event)
-	{
-		if (!config.enabled() || !isLocked || lockedScrollY < 0)
-		{
-			return;
-		}
-
-		// Restore scroll position after game processes the message
-		clientThread.invokeLater(() ->
-		{
-			Widget chatbox = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
-			if (chatbox == null)
+			if (atBottom)
 			{
-				return;
+				// User scrolled to bottom, unlock
+				isLocked = false;
+				lockedDistanceFromBottom = -1;
+				log.debug("Unlocked - at bottom");
 			}
+			else
+			{
+				// Restore position by setting scrollY based on locked distance from bottom
+				int scrollHeight = chatbox.getScrollHeight();
+				int height = chatbox.getHeight();
+				int targetScrollY = scrollHeight - height - lockedDistanceFromBottom;
 
-			// Set flag so GameTick knows to ignore this change
-			ignoringScrollChange = true;
-
-			chatbox.setScrollY(lockedScrollY);
-			chatbox.revalidateScroll();
-			log.debug("Restored to scrollY: {}", lockedScrollY);
-		});
+				if (targetScrollY >= 0)
+				{
+					chatbox.setScrollY(targetScrollY);
+					log.debug("Restored to distance {} (scrollY: {})", lockedDistanceFromBottom, targetScrollY);
+				}
+			}
+		}
+		else
+		{
+			if (!atBottom)
+			{
+				// User scrolled up, lock at current position
+				isLocked = true;
+				lockedDistanceFromBottom = distanceFromBottom;
+				log.debug("Locked at distance from bottom: {}", lockedDistanceFromBottom);
+			}
+		}
 	}
 
 	@Provides
