@@ -6,8 +6,9 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.events.ScriptPostFired;
-import net.runelite.api.ScriptID;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
@@ -27,11 +28,18 @@ public class ChatScrollLockPlugin extends Plugin
 	private Client client;
 
 	@Inject
+	private ClientThread clientThread;
+
+	@Inject
 	private ChatScrollLockConfig config;
 
-	// Track distance from bottom when locked (more stable than absolute scrollY)
+	// Track distance from bottom (stable across scrollHeight changes)
 	private int lockedDistanceFromBottom = -1;
 	private boolean isLocked = false;
+
+	// Debounce restoration
+	private int ticksSinceLastRestore = 0;
+	private static final int RESTORE_COOLDOWN = 1;
 
 	@Override
 	protected void startUp() throws Exception
@@ -51,6 +59,7 @@ public class ChatScrollLockPlugin extends Plugin
 	{
 		lockedDistanceFromBottom = -1;
 		isLocked = false;
+		ticksSinceLastRestore = 0;
 	}
 
 	private int getDistanceFromBottom(Widget chatbox)
@@ -58,8 +67,7 @@ public class ChatScrollLockPlugin extends Plugin
 		int scrollY = chatbox.getScrollY();
 		int scrollHeight = chatbox.getScrollHeight();
 		int height = chatbox.getHeight();
-		// Distance from bottom = how far up from the bottom we are
-		return scrollHeight - height - scrollY;
+		return Math.max(0, scrollHeight - height - scrollY);
 	}
 
 	private boolean isAtBottom(Widget chatbox)
@@ -68,18 +76,15 @@ public class ChatScrollLockPlugin extends Plugin
 	}
 
 	@Subscribe
-	public void onScriptPostFired(ScriptPostFired event)
+	public void onGameTick(GameTick event)
 	{
 		if (!config.enabled())
 		{
+			reset();
 			return;
 		}
 
-		// BUILD_CHATBOX is the script that runs when chat is updated
-		if (event.getScriptId() != ScriptID.BUILD_CHATBOX)
-		{
-			return;
-		}
+		ticksSinceLastRestore++;
 
 		Widget chatbox = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
 		if (chatbox == null)
@@ -88,41 +93,62 @@ public class ChatScrollLockPlugin extends Plugin
 		}
 
 		int distanceFromBottom = getDistanceFromBottom(chatbox);
-		boolean atBottom = distanceFromBottom <= BOTTOM_THRESHOLD;
+		boolean atBottom = isAtBottom(chatbox);
 
-		if (isLocked)
+		// Detect user scroll
+		if (isLocked && atBottom)
 		{
-			if (atBottom)
-			{
-				// User scrolled to bottom, unlock
-				isLocked = false;
-				lockedDistanceFromBottom = -1;
-				log.debug("Unlocked - at bottom");
-			}
-			else
-			{
-				// Restore position by setting scrollY based on locked distance from bottom
-				int scrollHeight = chatbox.getScrollHeight();
-				int height = chatbox.getHeight();
-				int targetScrollY = scrollHeight - height - lockedDistanceFromBottom;
-
-				if (targetScrollY >= 0)
-				{
-					chatbox.setScrollY(targetScrollY);
-					log.debug("Restored to distance {} (scrollY: {})", lockedDistanceFromBottom, targetScrollY);
-				}
-			}
+			// User scrolled to bottom - unlock
+			isLocked = false;
+			lockedDistanceFromBottom = -1;
+			log.debug("Unlocked - user at bottom");
 		}
-		else
+		else if (!isLocked && !atBottom)
 		{
-			if (!atBottom)
+			// User scrolled up from bottom - lock
+			isLocked = true;
+			lockedDistanceFromBottom = distanceFromBottom;
+			log.debug("Locked at distance: {}", lockedDistanceFromBottom);
+		}
+		else if (isLocked && ticksSinceLastRestore > RESTORE_COOLDOWN)
+		{
+			// While locked, update if user scrolled to different position
+			if (Math.abs(distanceFromBottom - lockedDistanceFromBottom) > BOTTOM_THRESHOLD)
 			{
-				// User scrolled up, lock at current position
-				isLocked = true;
 				lockedDistanceFromBottom = distanceFromBottom;
-				log.debug("Locked at distance from bottom: {}", lockedDistanceFromBottom);
+				log.debug("Updated lock to distance: {}", lockedDistanceFromBottom);
 			}
 		}
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (!config.enabled() || !isLocked || lockedDistanceFromBottom < 0)
+		{
+			return;
+		}
+
+		// Delay restoration slightly to let the game finish updating
+		clientThread.invokeLater(() ->
+		{
+			Widget chatbox = client.getWidget(ComponentID.CHATBOX_MESSAGE_LINES);
+			if (chatbox == null || !isLocked)
+			{
+				return;
+			}
+
+			int scrollHeight = chatbox.getScrollHeight();
+			int height = chatbox.getHeight();
+			int targetScrollY = scrollHeight - height - lockedDistanceFromBottom;
+
+			if (targetScrollY >= 0 && targetScrollY != chatbox.getScrollY())
+			{
+				chatbox.setScrollY(targetScrollY);
+				ticksSinceLastRestore = 0;
+				log.debug("Restored: distance={}, scrollY={}", lockedDistanceFromBottom, targetScrollY);
+			}
+		});
 	}
 
 	@Provides
